@@ -96,7 +96,7 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
     agentRunning, modelNames, modelList, modelThinkingLevels, modelThinkingLevelMaps, toolPreset, thinkingLevel,
     retryInfo, contextUsage, forkingEntryId,
     isCompacting, compactError, displayModel: displayModelValue, sessionStats,
-    agentPhase,
+    agentPhase, supervisorWarning,
     isNew,
     messagesEndRef, scrollContainerRef,
     lastUserMsgRef,
@@ -290,6 +290,31 @@ export function ChatWindow({ session, newSessionCwd, onAgentEnd, onSessionCreate
       <div className="relative flex flex-1 overflow-hidden">
         <div ref={scrollContainerRef} className="flex-1 overflow-y-auto pt-4 [scrollbar-width:none]">
           <div className="mx-auto max-w-[820px] px-4">
+
+            {/* Supervisor状态提示 */}
+            {supervisorWarning && (
+              <div style={{
+                marginBottom: 12,
+                padding: "12px 14px",
+                background: supervisorWarning.includes('⚠️') ? "rgba(239, 68, 68, 0.1)" : "rgba(34, 197, 94, 0.1)",
+                border: `1px solid ${supervisorWarning.includes('⚠️') ? 'rgba(239, 68, 68, 0.3)' : 'rgba(34, 197, 94, 0.3)'}`,
+                borderRadius: 8,
+                color: supervisorWarning.includes('⚠️') ? "#ef4444" : "#22c55e",
+                fontSize: 12,
+                lineHeight: 1.6,
+                animation: "fadeIn 0.2s ease",
+                whiteSpace: "pre-line",
+              }}>
+                <div style={{ fontWeight: 600, marginBottom: 4, display: "flex", alignItems: "center", gap: 6 }}>
+                  {supervisorWarning.includes('⚠️') ? (
+                    <>⚠️ 监督发现问题</>
+                  ) : (
+                    <>✓ 监督报告</>
+                  )}
+                </div>
+                <div>{supervisorWarning.replace('⚠️ ', '')}</div>
+              </div>
+            )}
 
             {(() => {
               const toolResultsMap = new Map<string, import("@/lib/types").ToolResultMessage>();

@@ -5,6 +5,8 @@ import type { AgentMessage, SessionInfo, SessionTreeNode } from "@/lib/types";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { sendAgentCommand } from "@/lib/agent-client";
 import type { ToolEntry } from "@/components/ToolPanel";
+import { analyzeToolCall, shouldAnalyze, reportCommandResult, writeSupervisorLog } from "@/lib/supervisor";
+import type { SupervisorState } from "@/lib/supervisor";
 
 export interface SessionData {
   sessionId: string;
@@ -114,6 +116,8 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
   const [isCompacting, setIsCompacting] = useState(false);
   const [compactError, setCompactError] = useState<string | null>(null);
   const [agentPhase, setAgentPhase] = useState<AgentPhase>(null);
+  const [supervisorState, setSupervisorState] = useState<SupervisorState | null>(null);
+  const [supervisorWarning, setSupervisorWarning] = useState<string | null>(null);
 
   const eventSourceRef = useRef<EventSource | null>(null);
   const sessionIdRef = useRef<string | null>(session?.id ?? null);
@@ -242,7 +246,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     agentRunningRef.current = agentRunning;
   }, [agentRunning]);
 
-  const handleAgentEvent = useCallback((event: AgentEvent) => {
+  const handleAgentEvent = useCallback(async (event: AgentEvent) => {
     switch (event.type) {
       case "agent_start":
         setAgentRunning(true);
@@ -295,10 +299,226 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           if (!tools.some((t) => t.id === id)) tools.push({ id, name });
           return { kind: "running_tools", tools };
         });
+        
+        // Supervisor检查 - 纯规则监督（不依赖LLM）
+        try {
+          const { getSupervisionEnabled } = await import('@/lib/supervisor/engine');
+          if (getSupervisionEnabled()) {
+            console.log('Supervisor: 纯规则监督已开启，检查工具调用:', name);
+            // event.args 里存着实际参数，不同toolName结构不同
+            const eventArgs = (event.args as any) || {};
+            const toolArgs = eventArgs.command || eventArgs.path || JSON.stringify(eventArgs);
+            console.log('Supervisor: 工具调用 -', name, '- 参数:', toolArgs.substring(0, 150));
+            const state = { active: true, outcome: '', provider: '', modelId: '', sensitivity: 'medium', interventions: [], startedAt: Date.now(), turnCount: 0 };
+            analyzeToolCall(state, name, toolArgs).then(async (decision) => {
+                console.log('Supervisor: 检查结果:', decision.action, decision.message);
+                
+                if (decision.action === 'steer' && decision.message) {
+                  // 记录干预
+                  const interventions = JSON.parse(localStorage.getItem('supervisor-interventions') || '[]');
+                  interventions.push({
+                    tool: name,
+                    issue: decision.message,
+                    time: new Date().toISOString()
+                  });
+                  localStorage.setItem('supervisor-interventions', JSON.stringify(interventions));
+                  
+                  const sid = sessionIdRef.current;
+                  
+                  // 🔴 红线违规（confidence > 0.95，如文件保护）→ 直接拦截，不给确认选项
+                  if (decision.confidence > 0.95) {
+                    console.log('Supervisor: 红线违规，直接拦截:', decision.message);
+                    writeSupervisorLog({ type: 'file_protection', content: decision.message, result: 'intercepted' });
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'steer',
+                        message: `[监督拦截] ${decision.message}。此操作违反红线规定，已被禁止。请向用户解释原因。`
+                      });
+                    }
+                    
+                    setSupervisorWarning(`🔴 ${decision.message}`);
+                    setTimeout(() => setSupervisorWarning(null), 10000);
+                    
+                  // ⛔ 连续失败（confidence 0.9~0.95）→ 让AI停下来，告知原因，等用户回复
+                  } else if (decision.confidence >= 0.9) {
+                    console.log('Supervisor: 连续失败，拦截并要求AI报告原因:', decision.message);
+                    
+                    writeSupervisorLog({ type: 'consecutive_failure', content: decision.message, result: 'intercepted' });
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'steer',
+                        message: `[监督拦截] ${decision.message}。请立即暂停，查看上方的执行记录，向用户总结失败原因（什么命令报错了、报错信息是什么），然后等用户给你新的指示。`
+                      });
+                    }
+                    
+                    setSupervisorWarning(`⛔ ${decision.message}`);
+                    setTimeout(() => setSupervisorWarning(null), 10000);
+                    
+                  // ⚠️ 技术栈切换+失败（confidence 0.85）→ 弹窗问用户同不同意
+                  } else if (decision.confidence >= 0.7) {
+                    console.log('Supervisor: 技术栈切换，拦截并询问用户:', decision.message);
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'steer',
+                        message: `[监督拦截] ${decision.message}。请先暂停，等待用户确认。`
+                      });
+                    }
+                    
+                    setSupervisorWarning(`⏳ ${decision.message}`);
+                    const userConfirmed = window.confirm(
+                      `⚠️ AI操作需要你的确认：\n\n${decision.message}\n\n是否同意？`
+                    );
+                    
+                    if (sid) {
+                      if (userConfirmed) {
+                        await sendAgentCommand(sid, {
+                          type: 'follow_up',
+                          message: `用户已同意上述操作，请继续执行。`
+                        });
+                        setSupervisorWarning(`✅ 已同意: ${decision.message}`);
+                        writeSupervisorLog({ type: 'tech_stack_switch', content: decision.message, result: 'user_approved' });
+                      } else {
+                        await sendAgentCommand(sid, {
+                          type: 'follow_up',
+                          message: `用户不同意上述操作，请换回原来的方案或向用户解释原因。`
+                        });
+                        setSupervisorWarning(`⛔ 已拒绝: ${decision.message}`);
+                        writeSupervisorLog({ type: 'tech_stack_switch', content: decision.message, result: 'user_rejected' });
+                      }
+                    }
+                    setTimeout(() => setSupervisorWarning(null), 8000);
+                    
+                  } else if (decision.message?.includes('📋')) {
+                    // 📋 搜索规范指南 → 发steer告知AI规范内容
+                    console.log('Supervisor: 搜索规范，发送指南:', decision.message);
+                    setSupervisorWarning(`📋 已发送搜索规范指南`);
+                    setTimeout(() => setSupervisorWarning(null), 6000);
+                    writeSupervisorLog({ type: 'search_guide', content: '已发送搜索规范指南', result: 'info' });
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'steer',
+                        message: decision.message
+                      });
+                    }
+                    
+                  } else if (decision.message?.includes('🔍')) {
+                    // 🔍 多维度搜索提醒 → 发steer让AI注意
+                    console.log('Supervisor: 搜索规范，多维度提醒:', decision.message);
+                    setSupervisorWarning(`🔍 ${decision.message}`);
+                    setTimeout(() => setSupervisorWarning(null), 8000);
+                    writeSupervisorLog({ type: 'search_multi_dim', content: decision.message, result: 'reminded' });
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'steer',
+                        message: decision.message
+                      });
+                    }
+                    
+                  } else if (decision.message?.includes('🖼️')) {
+                    // 🖼️ 图片处理顺序违规 → 发steer让AI纠正
+                    console.log('Supervisor: 图片处理，拦截并纠正:', decision.message);
+                    setSupervisorWarning(`🖼️ ${decision.message}`);
+                    setTimeout(() => setSupervisorWarning(null), 8000);
+                    writeSupervisorLog({ type: 'image_handling', content: decision.message, result: 'intercepted' });
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'steer',
+                        message: decision.message
+                      });
+                    }
+                    
+                  } else if (decision.message?.includes('⏰')) {
+                    // ⏰ 搜索未限定时间范围 → 发steer让AI纠正
+                    console.log('Supervisor: 搜索规范，拦截并纠正:', decision.message);
+                    setSupervisorWarning(`⏰ ${decision.message}`);
+                    setTimeout(() => setSupervisorWarning(null), 8000);
+                    writeSupervisorLog({ type: 'search_standard', content: decision.message, result: 'intercepted' });
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'steer',
+                        message: `[监督] ${decision.message}`
+                      });
+                    }
+                    
+                  } else if (decision.message?.includes('💡')) {
+                    // 💡 保存文件提醒 → 发steer让AI先问用户
+                    console.log('Supervisor: 保存文件，提醒确认路径:', decision.message);
+                    setSupervisorWarning(`💡 ${decision.message}`);
+                    setTimeout(() => setSupervisorWarning(null), 8000);
+                    writeSupervisorLog({ type: 'save_file_check', content: decision.message, result: 'reminded' });
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'steer',
+                        message: `[监督] ${decision.message}`
+                      });
+                    }
+                    
+                  } else {
+                    // 低置信度违规 → 只提醒，不强制
+                    console.log('Supervisor: 轻微违规，提醒AI:', decision.message);
+                    setSupervisorWarning(`💡 ${decision.message}`);
+                    setTimeout(() => setSupervisorWarning(null), 6000);
+                    writeSupervisorLog({ type: 'tech_stack_switch', content: decision.message, result: 'reminded' });
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'follow_up',
+                        message: `[监督提醒] ${decision.message}，请按照规范纠正你的行为。`
+                      });
+                    }
+                  }
+                } else if (decision.action === 'done') {
+                  // 任务完成，生成报告
+                  console.log('Supervisor: 任务完成');
+                  
+                  // 获取所有干预记录
+                  const interventions = JSON.parse(localStorage.getItem('supervisor-interventions') || '[]');
+                  
+                  // 生成报告
+                  let report = '✓ 监督完成\n\n';
+                  if (interventions.length > 0) {
+                    report += `发现 ${interventions.length} 个问题并已纠正：\n`;
+                    interventions.forEach((item: { tool: string; issue: string }, idx: number) => {
+                      report += `${idx + 1}. ${item.tool}: ${item.issue}\n`;
+                    });
+                  } else {
+                    report += '所有操作均符合规范，未发现问题。';
+                  }
+                  
+                  setSupervisorWarning(report);
+                  setTimeout(() => setSupervisorWarning(null), 10000);
+                  
+                  // 清空干预记录
+                  localStorage.removeItem('supervisor-interventions');
+                } else {
+                  // 检查通过
+                  console.log('Supervisor: 检查通过 -', name);
+                }
+              }).catch((err) => {
+                console.error('Supervisor检查失败:', err);
+              });
+            }
+         } catch (e) {
+          console.error('Supervisor: 读取状态失败:', e);
+        } 
         break;
       }
       case "tool_execution_end": {
         const id = event.toolCallId as string;
+        const toolName = event.toolName as string | undefined;
+        // 报告命令执行结果给技术栈跟踪器（有退出码就传，没有也不影响）
+        if (toolName) {
+          const exitCode = (event as Record<string, unknown>).exitCode as number | undefined;
+          reportCommandResult(toolName, exitCode);
+        }
         setAgentPhase((prev) => {
           if (prev?.kind !== "running_tools") return prev;
           const tools = prev.tools.filter((t) => t.id !== id);
@@ -387,6 +607,48 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         });
       } else if (session) {
         connectEvents(session.id);
+        
+        // 检测用户是否指定了保存路径
+        if (message && /保存到|写到|存到|放到|放在|写入|输出到|导出到|保存至/.test(message)) {
+          try {
+            const { markUserSpecifiedPath } = await import('@/lib/supervisor/engine');
+            markUserSpecifiedPath();
+            console.log('Supervisor: [保存文件] 用户已指定路径');
+          } catch (e) {
+            // ignore
+          }
+        }
+        
+        // 检测用户是否提到PPT
+        if (message && /PPT|pptx|演示文稿|幻灯片/.test(message)) {
+          try {
+            const { checkPPTStandard } = await import('@/lib/supervisor/engine');
+            const pptCheck = checkPPTStandard();
+            if (pptCheck) {
+              await sendAgentCommand(session.id, {
+                type: 'steer',
+                message: pptCheck
+              });
+              console.log('Supervisor: [PPT规范] 提醒AI读PPT经验文档');
+            }
+          } catch (e) {
+            // ignore
+          }
+        }
+        
+        // 如果用户发送了图片，提醒AI按规范处理
+        if (piImages && piImages.length > 0) {
+          try {
+            await sendAgentCommand(session.id, {
+              type: 'steer',
+              message: '[图片处理规范] 用户发送了图片，请按以下流程处理：\n1. 先用read工具读取图片\n2. 如果read失败（模型不支持），按PaddleOCR→EasyOCR→Tesseract顺序尝试OCR\n3. 最后告知用户是因为模型不支持才使用OCR的'
+            });
+            console.log('Supervisor: [图片处理] 已发送规范提醒');
+          } catch (e) {
+            // ignore
+          }
+        }
+        
         await sendAgentCommand(session.id, {
           type: "prompt",
           message,
@@ -645,6 +907,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
     isCompacting, compactError, currentModel, displayModel, sessionStats,
     agentPhase,
     isNew,
+    supervisorWarning,
     // Refs
     sessionIdRef, eventSourceRef, messagesEndRef, scrollContainerRef,
     lastUserMsgRef, pendingScrollToUserRef, initialScrollDoneRef,

@@ -1,0 +1,405 @@
+/**
+ * supervisor-engine.ts — Web版监督逻辑（最终版）
+ * 
+ * 核心思想：
+ * 1. 检查而不是禁止
+ * 2. 覆盖所有操作
+ * 3. 从agents文档读取规范
+ * 4. 只是提醒，不打断工作流程
+ */
+
+import type { ConversationMessage, SteeringDecision, SupervisorState } from "./types";
+import { callSupervisorModel } from "./model-client";
+
+// ---- 操作类型定义 ----
+interface OperationInfo {
+  type: string;
+  description: string;
+  riskLevel: 'low' | 'medium' | 'high';
+}
+
+// ---- 工具类型映射 ----
+const TOOL_TYPE_MAP: Record<string, string> = {
+  // pi内置工具
+  'read': 'file_read',
+  'write': 'file_write',
+  'edit': 'file_edit',
+  'bash': 'command',
+  'grep': 'search',
+  'find': 'search',
+  'ls': 'directory',
+  
+  // skill调用（示例）
+  'skill:tavily-search': 'network_search',
+  'skill:tavily-extract': 'network_extract',
+  'skill:tavily-crawl': 'network_crawl',
+  
+  // 扩展调用
+  'extension:*': 'extension',
+};
+
+// ---- 风险等级定义 ----
+const RISK_LEVELS: Record<string, 'low' | 'medium' | 'high'> = {
+  // 低风险：读取操作
+  'file_read': 'low',
+  'search': 'low',
+  'directory': 'low',
+  
+  // 中风险：文件操作
+  'file_write': 'medium',
+  'file_edit': 'medium',
+  
+  // 高风险：命令执行、网络请求
+  'command': 'high',
+  'network_search': 'high',
+  'network_extract': 'high',
+  'network_crawl': 'high',
+  'extension': 'high',
+};
+
+/**
+ * 识别操作类型
+ * 基于工具调用识别，而不是AI的文本回复
+ */
+function identifyOperation(toolName: string, toolArgs: string): OperationInfo {
+  // 获取基础工具类型
+  let baseType = TOOL_TYPE_MAP[toolName] || 'other';
+  
+  // 对于bash命令，进一步分析
+  if (toolName === 'bash') {
+    const argsLower = toolArgs.toLowerCase();
+    
+    // 网络请求
+    if (argsLower.includes('curl') || argsLower.includes('wget') || argsLower.includes('fetch')) {
+      baseType = 'network_request';
+    }
+    // 执行代码
+    else if (argsLower.includes('python') || argsLower.includes('node') || argsLower.includes('npm')) {
+      baseType = 'code_execute';
+    }
+    // 包管理
+    else if (argsLower.includes('pip') || argsLower.includes('yarn')) {
+      baseType = 'package_manage';
+    }
+    // 其他命令
+    else {
+      baseType = 'shell_command';
+    }
+  }
+  
+  // 获取风险等级
+  const riskLevel = RISK_LEVELS[baseType] || 'low';
+  
+  return {
+    type: baseType,
+    description: getOperationDescription(baseType),
+    riskLevel
+  };
+}
+
+/**
+ * 获取操作描述
+ */
+function getOperationDescription(type: string): string {
+  const descriptions: Record<string, string> = {
+    'file_read': '读取文件',
+    'file_write': '写入文件',
+    'file_edit': '编辑文件',
+    'command': '执行命令',
+    'search': '搜索内容',
+    'directory': '列出目录',
+    'network_search': '网络搜索',
+    'network_extract': '内容提取',
+    'network_crawl': '网站爬取',
+    'network_request': '网络请求',
+    'code_execute': '执行代码',
+    'package_manage': '包管理',
+    'shell_command': 'Shell命令',
+    'extension': '扩展功能',
+    'other': '其他操作'
+  };
+  
+  return descriptions[type] || '未知操作';
+}
+
+/**
+ * 规范文档条目结构
+ */
+interface RuleEntry {
+  keyword: string;        // 操作类型关键词
+  ruleName: string;       // 规范名称
+  ruleContent: string;    // 规范内容
+}
+
+/**
+ * 从AGENTS.md解析出的规范条目
+ * 根据操作类型查找对应的规范
+ */
+const RULE_ENTRIES: RuleEntry[] = [
+  // 网络搜索相关
+  {
+    keyword: 'network_search',
+    ruleName: '网络搜索规范',
+    ruleContent: '必须真实：不能编造信息，不能捏造数据；必须有来源：提供真实来源链接；最好最新：优先最新信息'
+  },
+  {
+    keyword: 'skill:tavily-search',
+    ruleName: '网络搜索规范',
+    ruleContent: '必须真实：不能编造信息，不能捏造数据；必须有来源：提供真实来源链接；最好最新：优先最新信息'
+  },
+  {
+    keyword: 'skill:tavily-extract',
+    ruleName: '网络提取规范',
+    ruleContent: '必须提取真实内容，不能编造或篡改网页内容'
+  },
+  {
+    keyword: 'skill:tavily-crawl',
+    ruleName: '网络爬取规范',
+    ruleContent: '必须爬取真实内容，不能编造或篡改网页内容'
+  },
+  
+  // 命令执行相关
+  {
+    keyword: 'command',
+    ruleName: '命令执行规范',
+    ruleContent: '执行前必须告知用户，不能偷偷执行；不能偷偷换方案，如果原方案有问题必须告知用户；按照原计划执行，不能私自改变方案'
+  },
+  {
+    keyword: 'code_execute',
+    ruleName: '命令执行规范',
+    ruleContent: '执行前必须告知用户，不能偷偷执行；不能偷偷换方案，如果原方案有问题必须告知用户；按照原计划执行，不能私自改变方案'
+  },
+  {
+    keyword: 'package_manage',
+    ruleName: '命令执行规范',
+    ruleContent: '执行前必须告知用户，不能偷偷执行；不能偷偷换方案，如果原方案有问题必须告知用户；按照原计划执行，不能私自改变方案'
+  },
+  {
+    keyword: 'shell_command',
+    ruleName: '命令执行规范',
+    ruleContent: '执行前必须告知用户，不能偷偷执行；不能偷偷换方案，如果原方案有问题必须告知用户；按照原计划执行，不能私自改变方案'
+  },
+  
+  // 文件操作相关
+  {
+    keyword: 'file_write',
+    ruleName: '文件写入规范',
+    ruleContent: '写入文件前告知用户；删除文件前必须确认；重要文件操作需要用户确认'
+  },
+  {
+    keyword: 'file_edit',
+    ruleName: '文件编辑规范',
+    ruleContent: '编辑重要文件前告知用户；绝对禁止删除核心文件（MEMORY.md、SCRATCHPAD.md、AGENTS.md等）'
+  },
+];
+
+/**
+ * 根据操作类型查找对应的规范
+ * 如果没有对应规范，返回null（直接放行）
+ */
+function findRuleForOperation(toolName: string, toolArgs: string): RuleEntry | null {
+  // 获取基础工具类型
+  let baseType = TOOL_TYPE_MAP[toolName] || 'other';
+  
+  // 对于bash命令，进一步分析
+  if (toolName === 'bash') {
+    const argsLower = toolArgs.toLowerCase();
+    
+    if (argsLower.includes('curl') || argsLower.includes('wget') || argsLower.includes('fetch')) {
+      baseType = 'network_request';
+    } else if (argsLower.includes('python') || argsLower.includes('node') || argsLower.includes('npm')) {
+      baseType = 'code_execute';
+    } else if (argsLower.includes('pip') || argsLower.includes('yarn')) {
+      baseType = 'package_manage';
+    } else {
+      baseType = 'shell_command';
+    }
+  }
+  
+  // 查找对应的规范
+  const rule = RULE_ENTRIES.find(entry => entry.keyword === baseType);
+  
+  if (rule) {
+    console.log(`Supervisor: 找到规范 - ${rule.ruleName}`);
+    return rule;
+  }
+  
+  console.log(`Supervisor: 操作 ${baseType} 没有对应规范，直接放行`);
+  return null;
+}
+
+/**
+ * 加载规范文档（保留用于兼容）
+ */
+async function loadRulesFromAgentsDoc(): Promise<string> {
+  return RULE_ENTRIES.map(e => `【${e.ruleName}】${e.ruleContent}`).join('\n\n');
+}
+
+/**
+ * 构建监督提示词
+ */
+function buildSupervisorPrompt(
+  state: SupervisorState,
+  operation: OperationInfo,
+  rules: string,
+  toolName: string,
+  toolArgs: string
+): string {
+  return `
+你是一个AI助手的监督员。你的任务是检查AI的操作是否符合规范。
+
+【当前监督目标】
+${state.outcome}
+
+【操作信息】
+- 工具: ${toolName}
+- 操作类型: ${operation.description}
+- 风险等级: ${operation.riskLevel}
+- 工具参数: ${toolArgs.substring(0, 200)}${toolArgs.length > 200 ? '...' : ''}
+
+【相关规范】
+${rules}
+
+【你的任务】
+1. 检查AI的操作是否符合上述规范
+2. 如果符合，返回 {"action": "continue", "reasoning": "符合规范"}
+3. 如果不符合，返回 {"action": "steer", "message": "提醒内容", "reasoning": "违反规范的原因"}
+
+【注意】
+- 只在真正违反规范时才提醒
+- 不要频繁打断正常工作
+- 提醒要具体、明确
+- 不要禁止操作，只是提醒
+
+请分析并返回JSON格式的决策。
+  `;
+}
+
+// ---- 核心监督逻辑 ----
+
+/**
+ * 分析工具调用并返回监督决策
+ * 改进版：基于工具调用，而不是AI的文本回复
+ */
+export async function analyzeToolCall(
+  state: SupervisorState,
+  toolName: string,
+  toolArgs: string,
+  onDelta?: (accumulated: string) => void
+): Promise<SteeringDecision> {
+  console.log(`Supervisor: 分析工具调用 - ${toolName}`);
+  
+  // 1. 查找对应规范
+  const rule = findRuleForOperation(toolName, toolArgs);
+  
+  // 2. 没有对应规范，直接放行
+  if (!rule) {
+    console.log('Supervisor: 没有对应规范，直接放行');
+    return {
+      action: 'continue',
+      reasoning: '该操作没有对应规范，直接放行',
+      confidence: 1
+    };
+  }
+  
+  // 3. 识别操作类型（用于提示词）
+  const operation = identifyOperation(toolName, toolArgs);
+  
+  // 4. 构建监督提示词
+  const prompt = buildSupervisorPrompt(state, operation, rule.ruleContent, toolName, toolArgs);
+  
+  // 5. 调用LLM进行分析
+  console.log(`Supervisor: 调用LLM分析（规范：${rule.ruleName}）...`);
+  try {
+    const decision = await callSupervisorModel(
+      state.provider,
+      state.modelId,
+      '你是一个AI助手的监督员。',
+      prompt,
+      undefined,
+      onDelta
+    );
+    
+    console.log('Supervisor: 分析完成，决策:', decision.action);
+    return decision;
+  } catch (error) {
+    console.error('Supervisor: 分析失败:', error);
+    return {
+      action: 'continue',
+      reasoning: '分析失败，继续执行',
+      confidence: 0
+    };
+  }
+}
+
+/**
+ * 分析对话并返回监督决策
+ * 兼容旧版本
+ */
+export async function analyze(
+  state: SupervisorState,
+  messages: ConversationMessage[],
+  agentIsIdle: boolean,
+  onDelta?: (accumulated: string) => void
+): Promise<SteeringDecision> {
+  console.log('Supervisor: 开始分析对话...');
+  
+  // 如果代理空闲，检查任务是否完成
+  if (agentIsIdle) {
+    console.log('Supervisor: 代理空闲，检查任务是否完成');
+    // 这里可以检查任务是否完成
+    return {
+      action: 'continue',
+      reasoning: '代理空闲，等待用户输入',
+      confidence: 1
+    };
+  }
+  
+  // 其他情况，直接通过
+  return {
+    action: 'continue',
+    reasoning: '继续执行',
+    confidence: 1
+  };
+}
+
+/**
+ * 检查是否应该进行分析
+ * 只在特定时机检查：
+ * 1. 高风险操作时
+ * 2. 代理空闲时
+ */
+export function shouldAnalyze(
+  state: SupervisorState,
+  agentIsIdle: boolean,
+  lastAnalysisTime: number,
+  toolName?: string
+): boolean {
+  const now = Date.now();
+  const timeSinceLastAnalysis = now - lastAnalysisTime;
+  
+  // 规则1：如果代理空闲，必须检查
+  if (agentIsIdle) {
+    console.log('Supervisor: 代理空闲，需要检查');
+    return true;
+  }
+  
+  // 规则2：如果是高风险工具，检查
+  if (toolName) {
+    const operation = identifyOperation(toolName, '');
+    if (operation.riskLevel === 'high') {
+      console.log('Supervisor: 高风险操作，需要检查');
+      return true;
+    }
+  }
+  
+  // 规则3：如果距离上次检查超过10分钟，检查一次
+  if (timeSinceLastAnalysis > 10 * 60 * 1000) {
+    console.log('Supervisor: 距离上次检查超过10分钟，需要检查');
+    return true;
+  }
+  
+  // 其他情况不检查，避免打断正常工作
+  console.log('Supervisor: 不需要检查，继续正常工作');
+  return false;
+}

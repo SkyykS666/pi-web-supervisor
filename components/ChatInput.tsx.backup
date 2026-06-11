@@ -1,7 +1,6 @@
 "use client";
 
 import React, { useRef, useState, useCallback, useEffect, useImperativeHandle, forwardRef, KeyboardEvent } from "react";
-import { SupervisorPanel } from "./SupervisorPanel";
 
 export interface AttachedImage {
   data: string;   // base64, no prefix
@@ -621,7 +620,7 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
           <div style={{ flex: 1 }} />
 
           {/* RIGHT: thinking + tools preset + compact + sound (idle) | Stop + sound (streaming) */}
-          <div style={{ flex: "0 0 auto", display: "flex", alignItems: "center", gap: 2, marginLeft: "auto", position: "relative" }}>
+          <div style={{ flex: "0 0 auto", display: "flex", alignItems: "center", gap: 2, marginLeft: "auto" }}>
             {!isStreaming && onThinkingLevelChange && (
               <div ref={thinkingDropdownRef} style={{ position: "relative" }}>
                 <button
@@ -864,9 +863,6 @@ export const ChatInput = forwardRef<ChatInputHandle, Props>(function ChatInput({
                 Stop
               </button>
             )}
-
-            {/* 监督面板 */}
-            <SupervisorPanel />
 
             {onSoundToggle !== undefined && (
               <button
