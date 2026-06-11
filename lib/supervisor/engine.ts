@@ -92,13 +92,15 @@ const RULE_ENTRIES: RuleEntry[] = [
 
 // ========== 技术栈跟踪器 ==========
 
-// 技术栈关键词表（以后你觉得需要加啥就加）
+// 技术栈关键词表
+// ⚠️ 注意：只放主动执行命令的关键词，不放文件扩展名（如 .ts .py）
+// 因为AI读取/编辑文件时路径里可能包含这些扩展名，会导致误判
 const TECH_STACK_KEYWORDS: Record<string, string[]> = {
-  python: ['python', 'pip', 'conda', '.py', 'python3', 'flask', 'django', 'pandas', 'jupyter'],
-  node: ['node', 'npm', 'npx', 'yarn', '.js', '.ts', '.tsx', '.jsx', 'react', 'next'],
-  go: ['go', 'go run', '.go', 'golang'],
-  rust: ['rust', 'cargo', '.rs'],
-  java: ['java', 'maven', 'gradle', '.java', 'spring', 'javac'],
+  python: ['python', 'pip', 'conda', 'python3', 'flask', 'django', 'pandas', 'jupyter', 'uv'],
+  node: ['node ', 'npm ', 'npx ', 'yarn ', 'pnpm'],
+  go: ['go run', 'go build', 'go mod', 'golang'],
+  rust: ['cargo ', 'rustc'],
+  java: ['java ', 'maven ', 'gradle ', 'javac '],
 };
 
 // 当前会话的技术栈状态
@@ -387,13 +389,16 @@ function detectTechStack(commandOrArgs: string): string | null {
 /**
  * 在工具执行前检测技术栈切换
  * 返回 null = 没问题，返回 SteeringDecision = 需要提醒
+ * 
+ * ⚠️ 只对 bash 命令检测，不检测 write/edit
+ * 因为 write/edit 的参数是文件路径，可能包含 .ts .py 等扩展名但不代表切换技术栈
  */
 function checkTechStackSwitch(
   toolName: string,
   toolArgs: string
 ): SteeringDecision | null {
-  // 只对 bash 和 write 操作检测技术栈
-  if (toolName !== 'bash' && toolName !== 'write' && toolName !== 'edit') {
+  // 只对 bash 命令检测技术栈切换
+  if (toolName !== 'bash') {
     return null;
   }
 
@@ -685,7 +690,7 @@ export async function analyzeToolCall(
   const searchCheck = checkSearchStandard(toolName, toolArgs);
   if (searchCheck) {
     console.log(`Supervisor: [搜索规范] 提醒: ${searchCheck.message}`);
-    writeSupervisorLog({ type: 'search_standard', content: searchCheck.message, result: 'reminded' });
+    writeSupervisorLog({ type: 'search_standard', content: searchCheck.message || '', result: 'reminded' });
     return searchCheck;
   }
   
