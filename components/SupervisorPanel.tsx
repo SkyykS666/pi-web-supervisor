@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { SupervisorStateManager, loadConfig, loadConfigAsync, getAvailableModels, getDefaultSensitivity, getPresetGoals, setApiConfig, loadApiConfig, getApiConfig, readSupervisorLogs, clearSupervisorLogs } from "@/lib/supervisor";
-import { setSupervisionEnabled, writeSupervisorLog } from "@/lib/supervisor/engine";
+import { setSupervisionEnabled, writeSupervisorLog, loadSupervisionState } from "@/lib/supervisor/engine";
 import type { SupervisorLogEntry } from "@/lib/supervisor/types";
 
 interface Props {
@@ -27,6 +27,9 @@ export function SupervisorPanel({ onStateChange }: Props) {
   const [presetGoals, setPresetGoals] = useState<Array<{ name: string; goal: string; description?: string }>>([]);
 
   useEffect(() => {
+    // 恢复监督开关状态（刷新后保持开启）
+    try { loadSupervisionState(); } catch (e) { console.error('恢复监督状态失败:', e); }
+    
     // 优先读取用户手动保存的目标（localStorage）
     try {
       const savedGoal = localStorage.getItem('supervisor-goal');
@@ -173,23 +176,6 @@ export function SupervisorPanel({ onStateChange }: Props) {
             </div>
           )}
 
-          {/* 统计条 */}
-          {(() => {
-            const logs = readSupervisorLogs();
-            const intercepted = logs.filter(l => l.result === 'intercepted').length;
-            const reminded = logs.filter(l => l.result === 'reminded').length;
-            const info = logs.filter(l => l.result === 'info').length;
-            if (logs.length === 0) return null;
-            return (
-              <div style={{ display: "flex", gap: 8, marginBottom: 10, padding: "6px 8px", background: "var(--bg-secondary)", borderRadius: 4, fontSize: 11 }}>
-                <span style={{ color: "#ef4444", fontWeight: 500 }}>🔴 拦截 {intercepted}</span>
-                <span style={{ color: "#f59e0b", fontWeight: 500 }}>💡 提醒 {reminded}</span>
-                <span style={{ color: "#22c55e", fontWeight: 500 }}>ℹ️ 信息 {info}</span>
-                <span style={{ color: "var(--text-muted)", marginLeft: "auto" }}>共 {logs.length} 条</span>
-              </div>
-            );
-          })()}
-
           <div style={{ marginBottom: 8 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
               <span style={{ fontSize: 12, fontWeight: 600, color: "var(--text)" }}>监督日志</span>
@@ -203,10 +189,11 @@ export function SupervisorPanel({ onStateChange }: Props) {
   );
 }
 
-/** 可展开的日志列表 */
+/** 可展开的日志列表（含筛选tab） */
 function LogList() {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [logs, setLogs] = useState<SupervisorLogEntry[]>([]);
+  const [filter, setFilter] = useState<'all' | 'intercepted' | 'reminded'>('all');
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -219,53 +206,84 @@ function LogList() {
     return <div style={{ fontSize: 11, color: "var(--text-muted)", padding: 8 }}>暂无日志</div>;
   }
 
+  // 每个type对应一个关键图标（不重复）
   const typeIcon = (type: string) => {
     const icons: Record<string, string> = {
-      file_protection: '🔴', consecutive_failure: '⛔', tech_stack_switch: '⚙️',
+      file_protection: '⛔', consecutive_failure: '⛔', tech_stack_switch: '⚙️',
       search_guide: '📋', search_standard: '⏰', search_multi_dim: '🔍',
       image_handling: '🖼️', save_file_check: '💡', system: 'ℹ️',
     };
     return icons[type] || '💡';
   };
 
-  const typeColor = (type: string) => {
-    const colors: Record<string, string> = {
-      file_protection: '#ef4444', consecutive_failure: '#ef4444', tech_stack_switch: '#f59e0b',
-      search_guide: '#22c55e', search_standard: '#f59e0b', search_multi_dim: '#f59e0b',
-      image_handling: '#f59e0b', save_file_check: '#f59e0b', system: '#22c55e',
-    };
-    return colors[type] || 'var(--text-dim)';
-  };
+  // 去除内容开头的emoji（避免和typeIcon重复）
+  const stripLeadingEmoji = (text: string) => text.replace(/^[\u{1F000}-\u{1FFFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2300}-\u{23FF}\u{2000}-\u{206F}]\s*/u, '');
 
-  const resultLabel = (result: string) => {
-    const labels: Record<string, string> = { intercepted: '已拦截', reminded: '已提醒', info: '信息', user_approved: '用户同意', user_rejected: '用户拒绝' };
-    return labels[result] || result;
-  };
+  // 统计
+  const countIntercepted = logs.filter(l => l.result === 'intercepted').length;
+  const countReminded = logs.filter(l => l.result === 'reminded').length;
+  const countInfo = logs.filter(l => l.result === 'info').length;
+
+  // 筛选
+  const filtered = filter === 'all'
+    ? [...logs].reverse()
+    : [...logs.filter(l => l.result === filter)].reverse();
+
+  const tabStyle = (tab: 'all' | 'intercepted' | 'reminded'): React.CSSProperties => ({
+    padding: "4px 10px", border: "none", borderRadius: 4,
+    background: filter === tab ? "var(--bg-hover)" : "transparent",
+    color: filter === tab ? "var(--text)" : "var(--text-muted)",
+    cursor: "pointer", fontSize: 11, fontWeight: filter === tab ? 600 : 400,
+  });
 
   return (
-    <div style={{ maxHeight: 200, overflowY: "auto", background: "var(--bg-secondary)", borderRadius: 4, padding: 8, fontSize: 11, fontFamily: "var(--font-mono)", lineHeight: 1.6 }}>
-      {logs.slice().reverse().map((log) => {
-        const isExpanded = expandedId === log.id;
-        return (
-          <div key={log.id} style={{ marginBottom: 4, borderBottom: "1px solid var(--border)", paddingBottom: 4 }}>
-            <div onClick={() => setExpandedId(isExpanded ? null : log.id)} style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 6, color: typeColor(log.type) }}>
-              <span>{typeIcon(log.type)}</span>
-              <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{log.content}</span>
-              <span style={{ fontSize: 10, color: "var(--text-muted)", flexShrink: 0 }}>{resultLabel(log.result)}</span>
-              <span style={{ fontSize: 10, color: "var(--text-muted)", flexShrink: 0 }}>{new Date(log.timestamp).toLocaleTimeString()}</span>
-              <span style={{ transform: isExpanded ? "rotate(180deg)" : "none", transition: "transform 0.2s", color: "var(--text-muted)" }}>▼</span>
-            </div>
-            {isExpanded && (
-              <div style={{ marginTop: 6, padding: "6px 8px", background: "var(--bg)", borderRadius: 4, color: "var(--text-dim)", fontSize: 10, lineHeight: 1.8 }}>
-                <div><strong>类型:</strong> {log.type}</div>
-                <div><strong>结果:</strong> {resultLabel(log.result)}</div>
-                <div><strong>时间:</strong> {new Date(log.timestamp).toLocaleString()}</div>
-                {log.detail && <div><strong>详情:</strong> {log.detail}</div>}
+    <div>
+      {/* 统计+筛选栏 */}
+      <div style={{ display: "flex", gap: 4, marginBottom: 6, padding: "4px 6px", background: "var(--bg-secondary)", borderRadius: 4, fontSize: 11, alignItems: "center" }}>
+        <button onClick={() => setFilter('intercepted')} style={tabStyle('intercepted')}>
+          ⛔ 拦截 {countIntercepted}
+        </button>
+        <button onClick={() => setFilter('reminded')} style={tabStyle('reminded')}>
+          💡 提醒 {countReminded}
+        </button>
+        <button onClick={() => setFilter('all')} style={tabStyle('all')}>
+          ℹ️ 全部 {logs.length}
+        </button>
+      </div>
+
+      {/* 日志列表 */}
+      <div style={{ maxHeight: 180, overflowY: "auto", background: "var(--bg-secondary)", borderRadius: 4, padding: 8, fontSize: 11, fontFamily: "var(--font-mono)", lineHeight: 1.6 }}>
+        {filtered.length === 0 ? (
+          <span style={{ color: "var(--text-muted)", padding: 4 }}>无匹配日志</span>
+        ) : filtered.map((log) => {
+          const isExpanded = expandedId === log.id;
+          const colorMap: Record<string, string> = {
+            file_protection: '#ef4444', consecutive_failure: '#ef4444', tech_stack_switch: '#f59e0b',
+            search_guide: '#22c55e', search_standard: '#f59e0b', search_multi_dim: '#f59e0b',
+            image_handling: '#f59e0b', save_file_check: '#f59e0b', system: '#22c55e',
+          };
+          return (
+            <div key={log.id} style={{ marginBottom: 4, borderBottom: "1px solid var(--border)", paddingBottom: 4 }}>
+              <div onClick={() => setExpandedId(isExpanded ? null : log.id)}
+                   style={{ cursor: "pointer", display: "flex", alignItems: "center", gap: 6, color: colorMap[log.type] || 'var(--text-dim)' }}>
+                <span style={{ flexShrink: 0 }}>{typeIcon(log.type)}</span>
+                <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {stripLeadingEmoji(log.content)}
+                </span>
+                <span style={{ fontSize: 10, color: "var(--text-muted)", flexShrink: 0 }}>{new Date(log.timestamp).toLocaleTimeString()}</span>
+                <span style={{ transform: isExpanded ? "rotate(180deg)" : "none", transition: "transform 0.2s", color: "var(--text-muted)", flexShrink: 0 }}>▼</span>
               </div>
-            )}
-          </div>
-        );
-      })}
+              {isExpanded && (
+                <div style={{ marginTop: 6, padding: "6px 8px", background: "var(--bg)", borderRadius: 4, color: "var(--text-dim)", fontSize: 10, lineHeight: 1.8 }}>
+                  <div><strong>内容:</strong> {log.content}</div>
+                  <div><strong>类型:</strong> {log.type}</div>
+                  {log.detail && <div><strong>详情:</strong> {log.detail}</div>}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }

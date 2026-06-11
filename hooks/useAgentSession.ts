@@ -5,7 +5,7 @@ import type { AgentMessage, SessionInfo, SessionTreeNode } from "@/lib/types";
 import { normalizeToolCalls } from "@/lib/normalize";
 import { sendAgentCommand } from "@/lib/agent-client";
 import type { ToolEntry } from "@/components/ToolPanel";
-import { analyzeToolCall, shouldAnalyze, reportCommandResult, writeSupervisorLog } from "@/lib/supervisor";
+import { analyzeToolCall, shouldAnalyze, reportCommandResult, writeSupervisorLog, getSupervisionEnabled, markUserSpecifiedPath, checkPPTStandard, markUserRequestedImageView } from "@/lib/supervisor";
 import type { SupervisorState } from "@/lib/supervisor";
 
 export interface SessionData {
@@ -302,7 +302,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         
         // Supervisor检查 - 纯规则监督（不依赖LLM）
         try {
-          const { getSupervisionEnabled } = await import('@/lib/supervisor/engine');
           if (getSupervisionEnabled()) {
             console.log('Supervisor: 纯规则监督已开启，检查工具调用:', name);
             // event.args 里存着实际参数，不同toolName结构不同
@@ -340,21 +339,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
                     setSupervisorWarning(`🔴 ${decision.message}`);
                     setTimeout(() => setSupervisorWarning(null), 10000);
                     
-                  // ⛔ 连续失败（confidence 0.9~0.95）→ 让AI停下来，告知原因，等用户回复
+                  // ⛔ 连续失败（confidence 0.9~0.95）→ 直接终止任务，让AI停下来报告原因
                   } else if (decision.confidence >= 0.9) {
-                    console.log('Supervisor: 连续失败，拦截并要求AI报告原因:', decision.message);
+                    console.log('Supervisor: 连续失败，终止任务并要求AI报告原因:', decision.message);
                     
                     writeSupervisorLog({ type: 'consecutive_failure', content: decision.message, result: 'intercepted' });
                     
                     if (sid) {
+                      // 先发steer让AI暂停并报告
                       await sendAgentCommand(sid, {
                         type: 'steer',
-                        message: `[监督拦截] ${decision.message}。请立即暂停，查看上方的执行记录，向用户总结失败原因（什么命令报错了、报错信息是什么），然后等用户给你新的指示。`
+                        message: `[监督拦截] ${decision.message}。立即停止执行当前任务！向用户总结失败原因（什么方案失败了、失败了几次、报错信息是什么），然后明确告知用户此方案行不通，让用户决定下一步怎么做。不要继续尝试其他方案！`
                       });
+                      // 再发abort强制终止当前agent执行
+                      await sendAgentCommand(sid, { type: 'abort' });
                     }
                     
-                    setSupervisorWarning(`⛔ ${decision.message}`);
-                    setTimeout(() => setSupervisorWarning(null), 10000);
+                    setSupervisorWarning(`⛔ 任务已终止：${decision.message}`);
+                    setTimeout(() => setSupervisorWarning(null), 15000);
                     
                   // ⚠️ 技术栈切换+失败（confidence 0.85）→ 弹窗问用户同不同意
                   } else if (decision.confidence >= 0.7) {
@@ -447,12 +449,26 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
                       });
                     }
                     
-                  } else if (decision.message?.includes('💡')) {
-                    // 💡 保存文件提醒 → 发steer让AI先问用户
+                  } else if (decision.message?.includes('📂')) {
+                    // 📂 保存文件提醒 → 发steer让AI先问用户
                     console.log('Supervisor: 保存文件，提醒确认路径:', decision.message);
-                    setSupervisorWarning(`💡 ${decision.message}`);
+                    setSupervisorWarning(`📂 ${decision.message}`);
                     setTimeout(() => setSupervisorWarning(null), 8000);
                     writeSupervisorLog({ type: 'save_file_check', content: decision.message, result: 'reminded' });
+                    
+                    if (sid) {
+                      await sendAgentCommand(sid, {
+                        type: 'steer',
+                        message: `[监督] ${decision.message}`
+                      });
+                    }
+                    
+                  } else if (decision.message?.includes('💡')) {
+                    // 💡 技术栈切换（无失败记录）→ 低置信度提醒
+                    console.log('Supervisor: 技术栈切换，提醒AI告知:', decision.message);
+                    setSupervisorWarning(`💡 ${decision.message}`);
+                    setTimeout(() => setSupervisorWarning(null), 8000);
+                    writeSupervisorLog({ type: 'tech_stack_switch', content: decision.message, result: 'reminded' });
                     
                     if (sid) {
                       await sendAgentCommand(sid, {
@@ -611,7 +627,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // 检测用户是否指定了保存路径
         if (message && /保存到|写到|存到|放到|放在|写入|输出到|导出到|保存至/.test(message)) {
           try {
-            const { markUserSpecifiedPath } = await import('@/lib/supervisor/engine');
             markUserSpecifiedPath();
             console.log('Supervisor: [保存文件] 用户已指定路径');
           } catch (e) {
@@ -622,7 +637,6 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
         // 检测用户是否提到PPT
         if (message && /PPT|pptx|演示文稿|幻灯片/.test(message)) {
           try {
-            const { checkPPTStandard } = await import('@/lib/supervisor/engine');
             const pptCheck = checkPPTStandard();
             if (pptCheck) {
               await sendAgentCommand(session.id, {
@@ -636,14 +650,15 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
           }
         }
         
-        // 如果用户发送了图片，提醒AI按规范处理
+        // 如果用户发送了图片，标记为用户要求的图片识别，并提醒AI按规范处理
         if (piImages && piImages.length > 0) {
           try {
+            markUserRequestedImageView();
             await sendAgentCommand(session.id, {
               type: 'steer',
               message: '[图片处理规范] 用户发送了图片，请按以下流程处理：\n1. 先用read工具读取图片\n2. 如果read失败（模型不支持），按PaddleOCR→EasyOCR→Tesseract顺序尝试OCR\n3. 最后告知用户是因为模型不支持才使用OCR的'
             });
-            console.log('Supervisor: [图片处理] 已发送规范提醒');
+            console.log('Supervisor: [图片处理] 已标记用户要求读图+发送规范提醒');
           } catch (e) {
             // ignore
           }

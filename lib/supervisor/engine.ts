@@ -17,10 +17,25 @@ let isSupervisionEnabled = false;
 export function setSupervisionEnabled(enabled: boolean): void {
   isSupervisionEnabled = enabled;
   console.log(`Supervisor: 纯规则监督已${enabled ? '开启' : '关闭'}`);
+  // 持久化到localStorage，防止模块重载丢失状态
+  try { localStorage.setItem('supervisor-enabled', enabled ? 'true' : 'false'); } catch {}
 }
 
 export function getSupervisionEnabled(): boolean {
   return isSupervisionEnabled;
+}
+
+/** 从localStorage恢复监督开关状态（组件挂载时调用） */
+export function loadSupervisionState(): void {
+  try {
+    const saved = localStorage.getItem('supervisor-enabled');
+    if (saved === 'true') {
+      isSupervisionEnabled = true;
+      console.log('Supervisor: 从localStorage恢复监督状态 - 已开启');
+    }
+  } catch (e) {
+    console.error('Supervisor: 读取监督状态失败:', e);
+  }
 }
 
 // ========== 规范定义 ==========
@@ -211,6 +226,8 @@ function checkSearchStandard(toolName: string, toolArgs: string): SteeringDecisi
 // ========== 图片处理顺序检测（纯规则，零token消耗）==========
 
 // 图片处理状态
+// 注意：只有当AI明确在图片识别流程中（如读取用户提供的图片）才标记
+// 单纯read一个.jpg文件可能只是检查下载成功的文件，不是图片识别
 let hasTriedReadForImage = false;
 const OCR_PRIORITY = ['paddleocr', 'easyocr', 'tesseract'];
 let ocrAttempts: string[] = [];
@@ -222,9 +239,15 @@ function checkImageHandling(toolName: string, toolArgs: string): SteeringDecisio
   const lower = toolArgs.toLowerCase();
   
   // 检测read操作：判断是否为图片文件
+  // 只有用户明确要求看图片时（通过 markUserRequestedImageView 标记），才计入图片识别流程
+  // AI自己下载后检查文件不算图片识别
   if (toolName === 'read' && /\.(png|jpg|jpeg|gif|webp|bmp)/.test(lower)) {
-    hasTriedReadForImage = true;
-    console.log(`Supervisor: [图片处理] 已尝试read图片`);
+    if (userRequestedImageView) {
+      hasTriedReadForImage = true;
+      console.log(`Supervisor: [图片处理] 用户要求读图，已标记为图片识别流程`);
+    } else {
+      console.log(`Supervisor: [图片处理] read了图片文件，但非用户要求的图片识别，跳过标记`);
+    }
     return null;
   }
   
@@ -299,7 +322,7 @@ function checkSaveFileBeforeWrite(toolName: string, toolArgs: string): SteeringD
   console.log(`Supervisor: [保存文件] 提醒: 未确认路径`);
   return {
     action: 'steer',
-    message: `💡 请先询问用户要保存到哪里后再执行写操作`,
+    message: `📂 请先询问用户要保存到哪里后再执行写操作`,
     reasoning: '写文件前未确认用户指定的路径',
     confidence: 0.5
   };
@@ -331,6 +354,22 @@ function checkPPTRead(toolName: string, toolArgs: string): void {
 // 连续失败检测
 const techStackFailCount: Record<string, number> = {};
 const MAX_CONSECUTIVE_FAILURES = 3; // 同一个技术栈连续失败3次就停下来
+// 被永久拦截的技术栈（连续失败3次后加入，后续不再允许尝试）
+let blockedTechStacks = new Set<string>();
+
+// 标记用户是否主动要求查看图片（用于区分"用户要求读图"和"AI下载后检查文件"）
+let userRequestedImageView = false;
+
+/** 标记用户要求看图片（由前端在用户发送图片时调用） */
+export function markUserRequestedImageView(): void {
+  userRequestedImageView = true;
+  console.log('Supervisor: [图片处理] 用户要求读图，已标记');
+}
+
+/** 重置用户读图标记 */
+export function resetUserRequestedImageView(): void {
+  userRequestedImageView = false;
+}
 
 /**
  * 检测命令属于哪个技术栈
@@ -385,13 +424,13 @@ function checkTechStackSwitch(
       };
     }
 
-    // 没有失败记录 → 低置信度提醒，可能只是正常切换
+    // 没有失败记录 → 但切换本身需要用户确认
     console.log(`Supervisor: [技术栈切换] ${oldStack} → ${newStack}（无失败记录）`);
     return {
       action: 'steer',
-      message: `💡 注意到从 ${oldStack} 切换到了 ${newStack}，如果是用户同意的请忽略，如果是AI擅自决定的请告知用户`,
-      reasoning: `${oldStack}切换到${newStack}，但无失败记录，可能是正常切换也可能是私自换方案`,
-      confidence: 0.4
+      message: `📌 AI想从 ${oldStack} 切换到 ${newStack}，是否同意切换？`,
+      reasoning: `${oldStack}切换到${newStack}，需用户确认`,
+      confidence: 0.75
     };
   }
 
@@ -427,9 +466,22 @@ export function reportCommandResult(toolName: string, exitCode?: number): void {
 function checkConsecutiveFailures(): SteeringDecision | null {
   if (!currentTechStack) return null;
   
+  // 检测当前技术栈是否已被永久拦截
+  if (blockedTechStacks.has(currentTechStack)) {
+    console.log(`Supervisor: [技术栈] ${currentTechStack} 已被永久拦截，禁止再次尝试`);
+    return {
+      action: 'steer',
+      message: `⛔ ${currentTechStack} 方案已被终止。此方案已连续失败多次，请直接告知用户行不通，让用户决定下一步方向，不要再尝试该方案`,
+      reasoning: `${currentTechStack}已被永久拦截`,
+      confidence: 0.98
+    };
+  }
+  
   const failCount = techStackFailCount[currentTechStack] || 0;
   if (failCount >= MAX_CONSECUTIVE_FAILURES) {
-    console.log(`Supervisor: [技术栈] ${currentTechStack} 连续失败 ${failCount} 次，达到阈值`);
+    console.log(`Supervisor: [技术栈] ${currentTechStack} 连续失败 ${failCount} 次，达到阈值，永久拦截`);
+    // 加入永久拦截名单
+    blockedTechStacks.add(currentTechStack);
     // 清零避免重复触发
     techStackFailCount[currentTechStack] = 0;
     return {
@@ -453,6 +505,7 @@ export function resetTechStack(): void {
   for (const key of Object.keys(techStackFailCount)) {
     techStackFailCount[key] = 0;
   }
+  blockedTechStacks.clear();
   console.log('Supervisor: [技术栈] 状态已重置');
 }
 
@@ -632,8 +685,8 @@ export async function analyzeToolCall(
   const searchCheck = checkSearchStandard(toolName, toolArgs);
   if (searchCheck) {
     console.log(`Supervisor: [搜索规范] 提醒: ${searchCheck.message}`);
-    // 搜索规范是提醒级别，不拦截，只记录日志
     writeSupervisorLog({ type: 'search_standard', content: searchCheck.message, result: 'reminded' });
+    return searchCheck;
   }
   
   // 0a3. 再检测图片处理顺序（纯规则，零token消耗）
