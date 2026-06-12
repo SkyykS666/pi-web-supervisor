@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useCallback } from "react";
 import { SupervisorStateManager, loadConfig, loadConfigAsync, getAvailableModels, getDefaultSensitivity, getPresetGoals, setApiConfig, loadApiConfig, getApiConfig, readSupervisorLogs, clearSupervisorLogs } from "@/lib/supervisor";
-import { setSupervisionEnabled, writeSupervisorLog, loadSupervisionState } from "@/lib/supervisor/engine";
+import { setSupervisionEnabled, writeSupervisorLog, loadSupervisionState, getSupervisionEnabled } from "@/lib/supervisor/engine";
 import type { SupervisorLogEntry } from "@/lib/supervisor/types";
 
 interface Props {
@@ -36,7 +36,14 @@ export function SupervisorPanel({ onStateChange }: Props) {
       if (savedGoal) setOutcome(savedGoal);
     } catch (e) { console.error('Failed to load saved goal:', e); }
     
-    // 再读取 stateManager 的其他状态
+    // ⭐ 关键：先订阅监听器，再调用 loadFromStorage
+    // 这样 notifyListeners() 能立刻把当前状态推给新订阅的 listener，setState 才会被调用
+    const unsubscribe = stateManager.subscribe((newState) => {
+      setState(newState);
+      onStateChange?.(newState);
+    });
+    
+    // 再读取 stateManager 的其他状态（此时已经有 listener，notifyListeners 有效）
     stateManager.loadFromStorage();
     const savedState = stateManager.getState();
     if (savedState) {
@@ -44,10 +51,6 @@ export function SupervisorPanel({ onStateChange }: Props) {
         setSelectedModel({ provider: savedState.provider, modelId: savedState.modelId });
       }
     }
-    const unsubscribe = stateManager.subscribe((newState) => {
-      setState(newState);
-      onStateChange?.(newState);
-    });
     const savedApiConfig = loadApiConfig();
     if (savedApiConfig.endpoint) setApiEndpoint(savedApiConfig.endpoint);
     if (savedApiConfig.key) setApiKey(savedApiConfig.key);
@@ -130,7 +133,9 @@ export function SupervisorPanel({ onStateChange }: Props) {
     return supportedProviders.includes(selectedModel.provider);
   }, [selectedModel, apiKey, apiEndpoint]);
 
-  const isActive = state?.active === true;
+  // 同时检查两个来源：SupervisorStateManager 的 active 状态 + engine 的 isSupervisionEnabled
+  // 避免因状态不同步导致 UI 显示灰色但引擎还在运行
+  const isActive = state?.active === true || getSupervisionEnabled();
 
   return (
     <div style={{ position: "relative" }}>

@@ -324,7 +324,7 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
                   
                   const sid = sessionIdRef.current;
                   
-                  // 🔴 红线违规（confidence > 0.95，如文件保护）→ 直接拦截+中止，不给确认选项
+                  // 🔴 红线违规（confidence > 0.95，如文件保护）→ 直接拦截+中止+聊天消息告知用户
                   if (decision.confidence > 0.95) {
                     console.log('Supervisor: 红线违规，直接拦截+中止:', decision.message);
                     writeSupervisorLog({ type: 'file_protection', content: decision.message, result: 'intercepted' });
@@ -333,14 +333,23 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
                       await sendAgentCommand(sid, { type: 'abort' });
                       await sendAgentCommand(sid, {
                         type: 'steer',
-                        message: `[监督拦截] ${decision.message}。此操作违反红线规定，已被禁止。我已暂停当前操作，请向用户解释原因。`
+                        message: `[监督拦截] ${decision.message}。此操作违反红线规定，已被禁止。请向用户解释原因。`
                       });
                     }
                     
-                    setSupervisorWarning(`🔴 ${decision.message}`);
-                    setTimeout(() => setSupervisorWarning(null), 10000);
+                    // 在聊天界面插入可见消息告诉用户发生了什么
+                    setMessages((prev) => [...prev, {
+                      role: "user",
+                      content: `⛔ 监督拦截：${decision.message}\n\n此操作涉及核心文件，已被自动终止。请告诉我接下来要怎么做。`,
+                      timestamp: Date.now()
+                    } as AgentMessage]);
                     
-                  // ⛔ 连续失败（confidence 0.9~0.95）→ 先中止任务，再告知用户并询问下一步
+                    // 重置UI状态，停止转圈
+                    setAgentRunning(false);
+                    setAgentPhase(null);
+                    dispatch({ type: "end" });
+                    
+                  // ⛔ 连续失败（confidence 0.9~0.95）→ 先中止任务，在聊天界面告知用户
                   } else if (decision.confidence >= 0.9) {
                     console.log('Supervisor: 连续失败，终止任务并要求AI报告原因:', decision.message);
                     
@@ -356,16 +365,24 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
                       });
                     }
                     
-                    // 用户侧提示
-                    setSupervisorWarning(`⛔ 方案失败：${decision.message}\n\n请查看AI的总结，然后告诉它下一步怎么做`);
-                    setTimeout(() => setSupervisorWarning(null), 20000);
+                    // 在聊天界面插入可见消息告诉用户发生了什么
+                    setMessages((prev) => [...prev, {
+                      role: "user",
+                      content: `⛔ 监督拦截：${decision.message}\n\nAI的执行方案已连续失败，任务已自动终止。请稍等AI总结失败原因，然后告诉我下一步怎么做。`,
+                      timestamp: Date.now()
+                    } as AgentMessage]);
                     
-                  // ⚠️ 技术栈切换 → 先abort中止当前任务，再弹窗问用户
+                    // 重置UI状态，停止转圈
+                    setAgentRunning(false);
+                    setAgentPhase(null);
+                    dispatch({ type: "end" });
+                    
+                  // ⚠️ 技术栈切换 → 先abort中止当前任务，弹窗问用户+聊天界面显示结果
                   } else if (decision.confidence >= 0.7) {
                     console.log('Supervisor: 技术栈切换，中止任务并询问用户:', decision.message);
                     
                     if (sid) {
-                      // 先中止当前agent执行，确保消息不会等AI跑完才发送
+                      // 先中止当前agent执行
                       await sendAgentCommand(sid, { type: 'abort' });
                       await sendAgentCommand(sid, {
                         type: 'steer',
@@ -373,29 +390,43 @@ export function useAgentSession(opts: UseAgentSessionOptions) {
                       });
                     }
                     
-                    setSupervisorWarning(`⏳ ${decision.message}`);
+                    // 停止UI转圈
+                    setAgentRunning(false);
+                    setAgentPhase(null);
+                    dispatch({ type: "end" });
+                    
+                    // 弹窗问用户
                     const userConfirmed = window.confirm(
                       `⚠️ AI操作需要你的确认：\n\n${decision.message}\n\n是否同意？`
                     );
                     
                     if (sid) {
                       if (userConfirmed) {
+                        // 聊天界面显示你的决定
+                        setMessages((prev) => [...prev, {
+                          role: "user",
+                          content: `✅ 我同意：${decision.message}\n\n请继续执行。`,
+                          timestamp: Date.now()
+                        } as AgentMessage]);
                         await sendAgentCommand(sid, {
                           type: 'steer',
                           message: `用户已同意上述操作，请继续执行。`
                         });
-                        setSupervisorWarning(`✅ 已同意: ${decision.message}`);
                         writeSupervisorLog({ type: 'tech_stack_switch', content: decision.message, result: 'user_approved' });
                       } else {
+                        // 聊天界面显示你的决定
+                        setMessages((prev) => [...prev, {
+                          role: "user",
+                          content: `⛔ 我不同意：${decision.message}\n\n请换回原来的方案。`,
+                          timestamp: Date.now()
+                        } as AgentMessage]);
                         await sendAgentCommand(sid, {
                           type: 'steer',
                           message: `用户不同意上述操作，请换回原来的方案或向用户解释原因。`
                         });
-                        setSupervisorWarning(`⛔ 已拒绝: ${decision.message}`);
                         writeSupervisorLog({ type: 'tech_stack_switch', content: decision.message, result: 'user_rejected' });
                       }
                     }
-                    setTimeout(() => setSupervisorWarning(null), 8000);
                     
                   } else if (decision.message?.includes('📋')) {
                     // 📋 搜索规范指南 → 发steer告知AI规范内容

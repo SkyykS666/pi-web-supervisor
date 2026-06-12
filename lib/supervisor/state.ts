@@ -164,16 +164,16 @@ export class SupervisorStateManager {
 
   /**
    * 从localStorage恢复状态
+   * 
+   * 注意：不重置active状态，保持持久化时的原样
+   * 如果用户刷新页面，监督引擎的 isSupervisionEnabled 也会从 localStorage 恢复
+   * UI显示的状态应与实际引擎状态一致
    */
   loadFromStorage(): void {
     try {
       const saved = localStorage.getItem('supervisor-state');
       if (saved) {
         this.state = JSON.parse(saved);
-        // 页面刷新后，重置active状态为false
-        if (this.state) {
-          this.state.active = false;
-        }
         this.notifyListeners();
       }
     } catch (error) {
